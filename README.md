@@ -1,76 +1,100 @@
 # webot
 
-This directory contains `webot`, a minimal standalone WeChat bot that does not depend on OpenClaw.
+`webot` 是一个独立运行的微信机器人桥接程序，用来把微信消息接到本地 `codex cli`，再把结果回传到微信。
 
-It does five things:
+当前这版已经支持：
 
-- calls the same `ilink` HTTP endpoints used by the Weixin ClawBot plugin
-- links a Weixin account to the local machine with a QR code
-- receives direct text messages by long-polling
-- runs `codex exec` locally and sends the text result back to Weixin
-- forwards key Codex progress events and image outputs back to Weixin
+- 微信扫码登录
+- 长轮询接收私聊消息
+- 调用本地 `codex exec`
+- 把文本结果回发到微信
+- 把本地图片、视频、文件通过微信官方媒体链路发回微信
+- 通过本地 MCP server 把“发文本 / 发文件 / 发图片 / 发视频”能力暴露给 Codex
+- 为每个微信用户维护一份有上限的短记忆，避免原始聊天记录无限膨胀
 
-Current scope is intentionally narrow:
+当前限制：
 
-- single linked account
-- direct messages only
-- one Codex job at a time
-- no media, group chat, scheduling, or task queue yet
+- 单账号
+- 仅私聊
+- 同时只处理一个请求
+- 没有任务队列
+- 没有群聊支持
 
-## Install
+## 安装
 
-Run this inside the directory:
+在项目目录中执行：
 
 ```powershell
 npm install
 Copy-Item .\webot.config.example.json .\webot.config.json
 ```
 
-Edit `webot.config.json`:
+然后按需修改 `webot.config.json`，重点字段：
 
-- `workspaces`: whitelist of accessible working directories
-- `defaultWorkspace`: default workspace key
-- `allowedSenders`: allowed Weixin user IDs, or `[]` to allow all
-- `codex.command`: defaults to `codex`
-- `codex.sandbox`: start with `read-only`
-- `behavior.progressUpdates`: throttle how often progress is pushed back to Weixin
-- `media.upload`: image upload path used before sending Weixin image items
+- `workspaces`：允许访问的工作区
+- `defaultWorkspace`：默认工作区
+- `allowedSenders`：允许使用 bot 的微信用户 ID，留空表示不限制
+- `codex.command`：默认是 `codex`
+- `codex.sandbox`：当前建议使用 `danger-full-access`
+- `behavior.memory`：每个用户的短记忆配置
+- `media.cdnBaseUrl`：微信媒体上传地址
 
-## Login
+注意：
+
+- 不要把你自己的 `webot.config.json` 提交到仓库
+- 本地登录态保存在 `%USERPROFILE%\.webot`
+
+## 登录
 
 ```powershell
 node .\src\cli.mjs login
 ```
 
-The QR code is shown in the terminal. After you confirm in Weixin, local state is written to:
+也可以直接运行：
+
+```powershell
+.\login.cmd
+```
+
+扫码确认后，本地状态会写入：
 
 ```text
 %USERPROFILE%\.webot\state.json
 ```
 
-## Start
+## 启动与停止
 
-```powershell
-node .\src\cli.mjs start
-```
-
-Or on Windows:
+启动：
 
 ```powershell
 .\start.cmd
 ```
 
+重启：
+
+```powershell
+.\restart.cmd
+```
+
+停止：
+
+```powershell
+.\stop.cmd
+```
+
+脚本已经做了单实例处理，避免同一台机器上重复启动多个 `webot` 进程。
+
 ## MCP Server
 
-Webot also provides a local stdio MCP server so agents can explicitly send results back to WeChat instead of only describing local files.
+`webot` 自带一个本地 `stdio` MCP server，供 Codex 直接调用微信回传能力。
 
-Start it with:
+启动方式：
 
 ```powershell
 npm run mcp
 ```
 
-Current tools:
+当前提供的工具：
 
 - `webot_get_session_context`
 - `webot_send_text`
@@ -80,38 +104,19 @@ Current tools:
 - `webot_send_paths`
 - `webot_resolve_workspace_path`
 
-The MCP server reads session context from environment variables such as:
+这些工具内部会自行处理：
 
-- `WEBOT_API_BASE_URL`
-- `WEBOT_TOKEN`
-- `WEBOT_TO_USER_ID`
-- `WEBOT_CONTEXT_TOKEN`
-- `WEBOT_CDN_BASE_URL`
-- `WEBOT_WORKSPACE_PATH`
-- `WEBOT_CONFIG_PATH`
-- `WEBOT_STATE_DIR`
+- 微信会话上下文
+- `getuploadurl`
+- AES-128-ECB 加密
+- 微信 CDN 上传
+- `sendmessage`
 
-Or from a JSON file referenced by `WEBOT_SESSION_FILE`.
+也就是说，Codex 不需要理解底层微信协议，只需要调用高层工具。
 
-## Python Version
+## 微信命令
 
-A parallel Python implementation is also available.
-
-Install dependencies:
-
-```powershell
-python -m pip install -r .\pybridge\requirements.txt
-```
-
-Use:
-
-```powershell
-.\login-py.cmd
-.\start-py.cmd
-.\status-py.cmd
-```
-
-## Weixin Commands
+支持以下命令：
 
 - `/help`
 - `/repos`
@@ -120,34 +125,50 @@ Use:
 - `/reset`
 - `/repo <name> <prompt>`
 
-If `allowPlainTextPrompt` is `true`, plain text messages are treated as Codex prompts in the current workspace.
+如果 `allowPlainTextPrompt` 为 `true`，普通文本会直接作为当前工作区下的 Codex prompt 处理。
 
-## Design
+## 工作流程
 
-This tool does not reuse the OpenClaw runtime. It only reimplements the protocol surface that the published plugin exposed:
+一条微信消息的大致流程如下：
+
+1. `webot` 通过 `getupdates` 收到消息
+2. 根据发送人确定工作区和微信会话上下文
+3. 把当前用户的短记忆和本轮消息一起交给 `codex exec`
+4. Codex 需要把结果真正回到微信时，优先调用 `webot-mcp`
+5. `webot` 根据结果决定是否还需要补发文本或媒体
+6. 最终把纯文本、图片、视频或文件送回微信
+
+## 设计说明
+
+`webot` 没有复用 OpenClaw 的完整运行时，但复刻了它公开暴露出来的关键微信协议面：
 
 - `get_bot_qrcode`
 - `get_qrcode_status`
 - `getupdates`
+- `getuploadurl`
 - `sendmessage`
+- `getconfig`
+- `sendtyping`
 
-Codex flow:
+媒体发送链路参考了官方微信插件的实现方式：
 
-1. receive Weixin text
-2. resolve workspace and prompt
-3. run `codex exec --json --output-last-message`
-4. stream key JSON events back to Weixin as progress updates
-5. read final text output
-6. extract image references from the final reply, upload them, and send Weixin image messages
+1. 申请上传 URL
+2. 本地 AES-128-ECB 加密
+3. 上传到微信 CDN
+4. 使用媒体引用调用 `sendmessage`
 
-## Risks
+## 风险与后续建议
 
-- this is not a stable public SDK, so the remote protocol can change
-- there is no media support, task queue, or audit trail yet
-- `codex exec` on native Windows can still hit compatibility issues
-- before long-term use, add at least:
-  - strict `allowedSenders`
-  - explicit confirmation for write actions
-  - audit logging
-  - queued execution
-  - WSL execution support
+需要注意：
+
+- 这不是稳定公开 SDK，远端协议后续可能变
+- 原生 Windows 上跑 `codex exec` 仍可能碰到兼容性问题
+- 当前还没有队列、审计日志和更严格的权限控制
+
+如果要长期用，建议继续补：
+
+- 更严格的 `allowedSenders`
+- 对写操作增加确认机制
+- 审计日志
+- 队列化执行
+- 更完善的错误恢复
