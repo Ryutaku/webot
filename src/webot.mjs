@@ -1,0 +1,402 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import { runCodexPrompt } from "./codex-runner.mjs";
+import {
+  appendUserMemoryTurn,
+  buildUserMemoryPrompt,
+  clearUserWorkspace,
+  getUserSession,
+  getUserWorkspace,
+  pruneUserSessions,
+  rememberMessage,
+  rememberUserSession,
+  saveState,
+  setUserWorkspace,
+} from "./state.mjs";
+import { extractPlainText, getUpdates, sendTextMessage } from "./weixin-api.mjs";
+import { detectNewWorkspaceMediaFiles, detectResultMediaPaths, sendLocalMediaFile } from "./weixin-media.mjs";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function chunkText(text, maxLen = 3800) {
+  if (!text) return [""];
+  const chunks = [];
+  for (let i = 0; i < text.length; i += maxLen) {
+    chunks.push(text.slice(i, i + maxLen));
+  }
+  return chunks;
+}
+
+function shortenCommand(command, maxLen = 100) {
+  if (!command) return "";
+  return command.length <= maxLen ? command : `${command.slice(0, maxLen - 3)}...`;
+}
+
+function sanitizeProgressText(text, maxLen = 180) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return normalized.length <= maxLen ? normalized : `${normalized.slice(0, maxLen - 3)}...`;
+}
+
+function resolveWorkspace(cfg, state, fromUserId, rawText) {
+  const trimmed = rawText.trim();
+  if (trimmed.startsWith("/repo ")) {
+    const [, workspaceKey, ...rest] = trimmed.split(/\s+/);
+    return {
+      workspaceKey,
+      prompt: rest.join(" ").trim(),
+    };
+  }
+  return {
+    workspaceKey: getUserWorkspace(state, fromUserId, cfg.defaultWorkspace),
+    prompt: trimmed,
+  };
+}
+
+function resolveDirectMediaRequest(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) return null;
+  if (!/(发给我|传给我|发我|传我|send me)/i.test(text)) return null;
+
+  const directPathMatch = text.match(/([A-Za-z]:\\[^\r\n]+?\.(?:png|jpe?g|gif|webp|bmp|mp4|mov|mkv|webm|pdf|txt|json|zip))/i);
+  if (directPathMatch?.[1]) return directPathMatch[1];
+
+  const rootDriveMatch = text.match(/([A-Za-z])盘根目录(?:下)?(?:的)?([^\s，。！？]+?\.(?:png|jpe?g|gif|webp|bmp|mp4|mov|mkv|webm|pdf|txt|json|zip))/i);
+  if (rootDriveMatch?.[1] && rootDriveMatch?.[2]) {
+    return `${rootDriveMatch[1].toUpperCase()}:\\${rootDriveMatch[2]}`;
+  }
+
+  return null;
+}
+
+function buildHelp(cfg) {
+  const workspaceList = Object.keys(cfg.workspaces).join(", ");
+  return [
+    "Available commands:",
+    "/help Show this help",
+    "/repos List workspaces",
+    "/use <name> Set the current chat workspace",
+    "/where Show the current workspace",
+    "/reset Clear the current chat workspace preference",
+    "/repo <name> <prompt> Run a prompt in a specific workspace",
+    "Plain text messages are treated as prompts in the current workspace.",
+    `Workspaces: ${workspaceList}`,
+  ].join("\n");
+}
+
+function writeMcpSessionContext({ cfg, state, message, workspacePath }) {
+  const stateDir = cfg.stateDir;
+  fs.mkdirSync(stateDir, { recursive: true });
+  const sessionFile = path.join(stateDir, "mcp-session.json");
+  const session = getUserSession(state, message.from_user_id);
+  const payload = {
+    apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
+    token: state.account.token,
+    routeTag: cfg.routeTag || "",
+    toUserId: message.from_user_id,
+    contextToken: message.context_token || session?.contextToken || "",
+    cdnBaseUrl: cfg.media?.cdnBaseUrl || "",
+    workspacePath,
+    accountId: state.account.accountId || "",
+    stateDir,
+    configPath: cfg.configPath,
+  };
+  fs.writeFileSync(sessionFile, `${JSON.stringify(payload, null, 2)}\n`, "utf-8");
+}
+
+function resolveMessageContextToken(state, message) {
+  return message.context_token || getUserSession(state, message.from_user_id)?.contextToken || "";
+}
+
+function getConversationMemory(cfg, state, fromUserId) {
+  const settings = cfg.behavior?.memory || {};
+  if (settings.enabled === false) return "";
+  return buildUserMemoryPrompt(state, fromUserId, settings);
+}
+
+function summarizeMcpDelivery(events = []) {
+  const toolCalls = events
+    .filter((event) => event?.type === "item.completed" && event?.item?.type === "mcp_tool_call" && event?.item?.server === "webot")
+    .map((event) => event.item.tool)
+    .filter(Boolean);
+
+  return {
+    sentText: toolCalls.includes("webot_send_text"),
+    sentMedia: toolCalls.some((tool) => [
+      "webot_send_file",
+      "webot_send_image",
+      "webot_send_video",
+      "webot_send_paths",
+    ].includes(tool)),
+  };
+}
+
+function createProgressReporter({ cfg, state, message }) {
+  const settings = cfg.behavior?.progressUpdates || {};
+  const enabled = settings.enabled !== false;
+  const minIntervalMs = Number(settings.minIntervalMs || 4000);
+  const maxMessages = Number(settings.maxMessages || 8);
+  let sentCount = 0;
+  let lastSentAt = 0;
+  let lastText = "";
+  let sentCommandProgress = false;
+
+  async function send(text, force = false) {
+    if (!enabled) return;
+    const normalized = sanitizeProgressText(text);
+    if (!normalized) return;
+    if (normalized === lastText) return;
+
+    const now = Date.now();
+    if (!force && sentCount > 0 && now - lastSentAt < minIntervalMs) {
+      return;
+    }
+    if (!force && sentCount >= maxMessages) {
+      return;
+    }
+
+    await sendTextMessage({
+      apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
+      token: state.account.token,
+      routeTag: cfg.routeTag,
+      toUserId: message.from_user_id,
+      contextToken: message.context_token,
+      text: normalized,
+    });
+    sentCount += 1;
+    lastSentAt = now;
+    lastText = normalized;
+  }
+
+  return {
+    async onEvent(_event) {
+      if (!enabled) return;
+      return;
+    },
+  };
+}
+
+async function sendReply(cfg, state, message, text) {
+  const contextToken = resolveMessageContextToken(state, message);
+  for (const chunk of chunkText(text)) {
+    await sendTextMessage({
+      apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
+      token: state.account.token,
+      routeTag: cfg.routeTag,
+      toUserId: message.from_user_id,
+      contextToken,
+      text: chunk,
+    });
+  }
+}
+
+async function sendMediaFromResult({ cfg, state, message, workspacePath, resultText, runStartedAt }) {
+  if (cfg.media?.enabled === false) return;
+
+  const contextToken = resolveMessageContextToken(state, message);
+  const explicitPaths = detectResultMediaPaths(resultText, workspacePath);
+  const freshPaths = detectNewWorkspaceMediaFiles(workspacePath, runStartedAt - 1000);
+  const mediaPaths = [...new Set([...explicitPaths, ...freshPaths])];
+  for (const mediaPath of mediaPaths) {
+    await sendLocalMediaFile({
+      apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
+      token: state.account.token,
+      routeTag: cfg.routeTag,
+      toUserId: message.from_user_id,
+      contextToken,
+      filePath: mediaPath,
+      cdnBaseUrl: cfg.media?.cdnBaseUrl,
+    });
+  }
+}
+
+async function handleCommand({ cfg, state, message, rawText }) {
+  const fromUserId = message.from_user_id;
+  const [command, ...rest] = rawText.trim().split(/\s+/);
+
+  switch (command) {
+    case "/help":
+      await sendReply(cfg, state, message, buildHelp(cfg));
+      return true;
+    case "/repos":
+      await sendReply(
+        cfg,
+        state,
+        message,
+        `Workspaces:\n${Object.entries(cfg.workspaces).map(([name, dir]) => `${name}: ${dir}`).join("\n")}`,
+      );
+      return true;
+    case "/use": {
+      const workspace = rest[0];
+      if (!workspace || !cfg.workspaces[workspace]) {
+        await sendReply(cfg, state, message, "Workspace not found. Use /repos to see the available names.");
+        return true;
+      }
+      setUserWorkspace(state, fromUserId, workspace);
+      saveState(cfg.stateDir, state);
+      await sendReply(cfg, state, message, `Current workspace for this chat is now ${workspace}.`);
+      return true;
+    }
+    case "/where": {
+      const workspace = getUserWorkspace(state, fromUserId, cfg.defaultWorkspace);
+      await sendReply(cfg, state, message, `Current workspace: ${workspace}\nPath: ${cfg.workspaces[workspace]}`);
+      return true;
+    }
+    case "/reset":
+      clearUserWorkspace(state, fromUserId);
+      saveState(cfg.stateDir, state);
+      await sendReply(cfg, state, message, `Workspace preference cleared. Default workspace is ${cfg.defaultWorkspace}.`);
+      return true;
+    default:
+      return false;
+  }
+}
+
+function ensureAllowedSender(cfg, fromUserId) {
+  return !cfg.allowedSenders?.length || cfg.allowedSenders.includes(fromUserId);
+}
+
+export async function processIncomingMessage({ cfg, state, message, busyRef }) {
+  if (message?.message_type === 2) return;
+  if (rememberMessage(state, message?.message_id)) return;
+
+  const fromUserId = message?.from_user_id || "";
+  if (!fromUserId) return;
+  if (!ensureAllowedSender(cfg, fromUserId)) return;
+
+  rememberUserSession(state, fromUserId, {
+    contextToken: message?.context_token || "",
+    lastMessageId: String(message?.message_id || ""),
+  });
+  pruneUserSessions(state);
+
+  const rawText = extractPlainText(message);
+  if (!rawText) return;
+
+  if (rawText.startsWith("/")) {
+    const handled = await handleCommand({ cfg, state, message, rawText });
+    if (handled) return;
+  }
+
+  const directMediaPath = resolveDirectMediaRequest(rawText);
+  if (directMediaPath) {
+    if (!directMediaPath || !/\.[A-Za-z0-9]+$/.test(directMediaPath)) {
+      await sendReply(cfg, state, message, "I could not resolve the file path.");
+      return;
+    }
+    try {
+      const contextToken = resolveMessageContextToken(state, message);
+      await sendLocalMediaFile({
+        apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
+        token: state.account.token,
+        routeTag: cfg.routeTag,
+        toUserId: message.from_user_id,
+        contextToken,
+        filePath: directMediaPath,
+        cdnBaseUrl: cfg.media?.cdnBaseUrl,
+      });
+      return;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await sendReply(cfg, state, message, `Direct send failed:\n${detail}`);
+      return;
+    }
+  }
+
+  if (!cfg.behavior.allowPlainTextPrompt && !rawText.startsWith("/repo ")) {
+    await sendReply(cfg, state, message, "Plain text prompts are disabled. Use /repo <name> <prompt> instead.");
+    return;
+  }
+
+  const { workspaceKey, prompt } = resolveWorkspace(cfg, state, fromUserId, rawText);
+  if (!workspaceKey || !cfg.workspaces[workspaceKey]) {
+    await sendReply(cfg, state, message, "No valid workspace is configured. Check webot.config.json.");
+    return;
+  }
+  if (!prompt) {
+    await sendReply(cfg, state, message, "The prompt is empty.");
+    return;
+  }
+  if (prompt.length > cfg.behavior.maxPromptChars) {
+    await sendReply(cfg, state, message, `The prompt is too long. Current limit: ${cfg.behavior.maxPromptChars} characters.`);
+    return;
+  }
+  if (busyRef.busy) {
+    await sendReply(cfg, state, message, cfg.behavior.busyNotice);
+    return;
+  }
+
+  busyRef.busy = true;
+  const workspacePath = cfg.workspaces[workspaceKey];
+  const progress = createProgressReporter({ cfg, state, message });
+  const runStartedAt = Date.now();
+  const conversationMemory = getConversationMemory(cfg, state, fromUserId);
+
+  try {
+    writeMcpSessionContext({ cfg, state, message, workspacePath });
+    const result = await runCodexPrompt({
+      cfg,
+      workspacePath,
+      prompt,
+      conversationMemory,
+      onEvent: (event) => progress.onEvent(event),
+    });
+    const delivery = summarizeMcpDelivery(result.events);
+    appendUserMemoryTurn(state, fromUserId, "user", prompt, cfg.behavior?.memory || {});
+    appendUserMemoryTurn(state, fromUserId, "assistant", result.text, cfg.behavior?.memory || {});
+    if (!delivery.sentText) {
+      await sendReply(cfg, state, message, result.text);
+    }
+    if (!delivery.sentMedia) {
+      await sendMediaFromResult({
+        cfg,
+        state,
+        message,
+        workspacePath,
+        resultText: result.text,
+        runStartedAt,
+      });
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    await sendReply(cfg, state, message, `Execution failed:\n${detail}`);
+  } finally {
+    busyRef.busy = false;
+  }
+}
+
+export async function startWebot({ cfg, state }) {
+  if (!state.account?.token) {
+    throw new Error("No linked Weixin account found. Run login first.");
+  }
+
+  const busyRef = { busy: false };
+  console.log(`Listening as ${state.account.accountId} ...`);
+
+  while (true) {
+    try {
+      const resp = await getUpdates({
+        apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
+        token: state.account.token,
+        routeTag: cfg.routeTag,
+        cursor: state.cursor,
+      });
+
+      if (resp?.get_updates_buf) {
+        state.cursor = resp.get_updates_buf;
+        saveState(cfg.stateDir, state);
+      }
+
+      for (const message of resp?.msgs || []) {
+        await processIncomingMessage({ cfg, state, message, busyRef });
+        saveState(cfg.stateDir, state);
+      }
+    } catch (error) {
+      console.error(`Poll failed: ${error instanceof Error ? error.message : String(error)}`);
+      await sleep(3000);
+    }
+  }
+}
