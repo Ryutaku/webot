@@ -1,0 +1,8 @@
+node_modules/
+.webot/
+logs/
+*.log
+screenshot.png
+test.png
+webot.config.json
+bridge.config.json

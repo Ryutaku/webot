@@ -1,0 +1,26 @@
+{
+  "name": "webot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone WeChat bot between Weixin ClawBot channel APIs and Codex CLI",
+  "type": "module",
+  "bin": {
+    "webot": "./src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/cli.mjs start",
+    "login": "node ./src/cli.mjs login",
+    "status": "node ./src/cli.mjs status",
+    "logout": "node ./src/cli.mjs logout",
+    "check": "node ./src/cli.mjs status",
+    "mcp": "node ./src/webot-mcp.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.3.6"
+  }
+}
