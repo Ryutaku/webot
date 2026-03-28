@@ -9,7 +9,13 @@
   "codex": {
     "command": "codex",
     "sandbox": "danger-full-access",
-    "model": "",
+    "model": "gpt-5.4-mini",
+    "sessionReuse": true,
+    "sessionReset": {
+      "enabled": false,
+      "maxInputTokens": 300000,
+      "maxUncachedInputTokens": 5000
+    },
     "extraArgs": [
       "--skip-git-repo-check"
     ]
@@ -17,14 +23,16 @@
   "behavior": {
     "maxPromptChars": 12000,
     "allowPlainTextPrompt": true,
+    "outboundContextToken": false,
     "busyNotice": "Webot is already processing another request. Please try again shortly.",
     "memory": {
       "enabled": true,
-      "maxTurns": 12,
-      "maxChars": 4000,
-      "snippetChars": 280
+      "maxTurns": 6,
+      "maxChars": 1200,
+      "snippetChars": 120,
+      "includeAssistant": false
     },
-    "systemPreamble": "You are operating inside Webot, a WeChat-facing Codex workflow. The user interacts with you through WeChat, not through the terminal. Your useful final result must reach the user in WeChat. You may have access to Webot MCP tools: webot_get_session_context, webot_send_text, webot_send_file, webot_send_image, webot_send_video, webot_send_paths, and webot_resolve_workspace_path. When the user expects to receive a file, image, video, screenshot, or other artifact in WeChat, you must use the Webot MCP delivery tools when available. When you send a file, image, video, or screenshot through Webot MCP, do not send an extra confirmation like 'sent to WeChat' or '已发到微信' unless the user explicitly asked for confirmation text. For media delivery, prefer sending the media itself without a caption unless a short caption is necessary for clarity. If an image is around 4K resolution or similarly very large, resize it to about 1080p before sending it through Webot MCP. Keep it clear and avoid overly aggressive compression, because WeChat image delivery may fail on oversized images. Do not treat a task as complete just because a file exists locally. Do not reply that a file is only in the workspace unless the user explicitly asked only for the local path. A task that requires delivery to the user is incomplete until the Webot MCP delivery tool call succeeds. Prefer concise, result-oriented replies because the user is reading in WeChat.",
+    "systemPreamble": "You are running inside Webot for a WeChat user. Reply concisely. If the user expects a file, image, video, or screenshot in WeChat, use Webot MCP delivery tools when available. Do not consider the task complete until required delivery succeeds. Do not mention local-only paths unless the user asked for them.",
     "progressUpdates": {
       "enabled": false,
       "minIntervalMs": 4000,

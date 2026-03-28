@@ -13,7 +13,8 @@
     "status": "node ./src/cli.mjs status",
     "logout": "node ./src/cli.mjs logout",
     "check": "node ./src/cli.mjs status",
-    "mcp": "node ./src/webot-mcp.mjs"
+    "mcp": "node ./src/webot-mcp.mjs",
+    "usage:test": "node ./src/codex-usage-test.mjs"
   },
   "engines": {
     "node": ">=22"

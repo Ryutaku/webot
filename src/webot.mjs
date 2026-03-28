@@ -4,6 +4,7 @@ import path from "node:path";
 import { buildAdminActionReply, detectAdminAction } from "./admin-actions.mjs";
 import { runCodexPrompt } from "./codex-runner.mjs";
 import {
+  appendCodexUsage,
   appendUserMemoryTurn,
   clearCodexSession,
   buildUserMemoryPrompt,
@@ -15,7 +16,7 @@ import {
   rememberMessage,
   rememberUserSession,
   saveState,
-  setCodexSession,
+  updateCodexSessionUsage,
   setUserWorkspace,
 } from "./state.mjs";
 import { extractPlainText, getUpdates, sendTextMessage } from "./weixin-api.mjs";
@@ -43,6 +44,36 @@ function sanitizeProgressText(text, maxLen = 180) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return "";
   return normalized.length <= maxLen ? normalized : `${normalized.slice(0, maxLen - 3)}...`;
+}
+
+function formatTokenCount(value) {
+  return Number(value || 0).toLocaleString("en-US");
+}
+
+function formatHitRate(cachedTokens, inputTokens) {
+  const input = Number(inputTokens || 0);
+  if (!input) return "0.0%";
+  const cached = Number(cachedTokens || 0);
+  return `${((cached / input) * 100).toFixed(1)}%`;
+}
+
+function normalizeNewSessionDirective(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return { requested: false, prompt: "" };
+  }
+
+  const match = raw.match(
+    /^(?:请|帮我|麻烦)?(?:重新|再次)?(?:新开|新建|开启|打开|重开)(?:一个|个)?(?:codex)?(?:会话|新会话|对话)(?:吧|一下|一下子)?[：:，,\s。-]*/i,
+  );
+  if (!match) {
+    return { requested: false, prompt: raw };
+  }
+
+  return {
+    requested: true,
+    prompt: raw.slice(match[0].length).trim(),
+  };
 }
 
 function resolveWorkspace(cfg, state, fromUserId, rawText) {
@@ -89,6 +120,7 @@ function buildHelp(cfg) {
     "/stop Stop Webot locally",
     "/status Show Webot runtime status",
     "Plain text messages are treated as prompts in the current workspace.",
+    "Send '新开会话' / '新建会话' / '开启新会话' to force a fresh Codex session.",
     `Workspaces: ${workspaceList}`,
   ].join("\n");
 }
@@ -103,7 +135,9 @@ function writeMcpSessionContext({ cfg, state, message, workspacePath }) {
     token: state.account.token,
     routeTag: cfg.routeTag || "",
     toUserId: message.from_user_id,
-    contextToken: message.context_token || session?.contextToken || "",
+    contextToken: cfg.behavior?.outboundContextToken === true
+      ? (message.context_token || session?.contextToken || "")
+      : "",
     cdnBaseUrl: cfg.media?.cdnBaseUrl || "",
     workspacePath,
     accountId: state.account.accountId || "",
@@ -117,15 +151,42 @@ function resolveMessageContextToken(state, message) {
   return message.context_token || getUserSession(state, message.from_user_id)?.contextToken || "";
 }
 
+function resolveOutboundContextToken(cfg, state, message) {
+  if (cfg.behavior?.outboundContextToken !== true) return "";
+  return resolveMessageContextToken(state, message);
+}
+
 function getConversationMemory(cfg, state, fromUserId) {
   const settings = cfg.behavior?.memory || {};
   if (settings.enabled === false) return "";
   return buildUserMemoryPrompt(state, fromUserId, settings);
 }
 
-async function runCodexWithSession({ cfg, state, fromUserId, workspaceKey, workspacePath, prompt, conversationMemory, onEvent }) {
+function formatUsageForLog(usage) {
+  if (!usage) return "";
+  return [
+    `input=${usage.inputTokens}`,
+    `cached=${usage.cachedInputTokens}`,
+    `uncached=${usage.uncachedInputTokens}`,
+    `output=${usage.outputTokens}`,
+    `total=${usage.totalTokens}`,
+    `hit=${formatHitRate(usage.cachedInputTokens, usage.inputTokens)}`,
+  ].join(" ");
+}
+
+async function runCodexWithSession({
+  cfg,
+  state,
+  fromUserId,
+  workspaceKey,
+  workspacePath,
+  prompt,
+  conversationMemory,
+  onEvent,
+  forceNewSession = false,
+}) {
   const reuseEnabled = cfg.codex?.sessionReuse !== false;
-  const existingSession = reuseEnabled ? getCodexSession(state, fromUserId, workspaceKey) : null;
+  const existingSession = reuseEnabled && !forceNewSession ? getCodexSession(state, fromUserId, workspaceKey) : null;
 
   try {
     const result = await runCodexPrompt({
@@ -136,13 +197,6 @@ async function runCodexWithSession({ cfg, state, fromUserId, workspaceKey, works
       resumeSessionId: existingSession?.id || "",
       onEvent,
     });
-
-    if (reuseEnabled && result.sessionId) {
-      setCodexSession(state, fromUserId, workspaceKey, {
-        id: result.sessionId,
-        workspacePath,
-      });
-    }
     return result;
   } catch (error) {
     if (existingSession && error?.resumeFailed) {
@@ -154,12 +208,6 @@ async function runCodexWithSession({ cfg, state, fromUserId, workspaceKey, works
         conversationMemory,
         onEvent,
       });
-      if (reuseEnabled && retry.sessionId) {
-        setCodexSession(state, fromUserId, workspaceKey, {
-          id: retry.sessionId,
-          workspacePath,
-        });
-      }
       return retry;
     }
     throw error;
@@ -229,9 +277,9 @@ function createProgressReporter({ cfg, state, message }) {
 }
 
 async function sendReply(cfg, state, message, text) {
-  const contextToken = resolveMessageContextToken(state, message);
+  const contextToken = resolveOutboundContextToken(cfg, state, message);
   for (const chunk of chunkText(text)) {
-    await sendTextMessage({
+    const response = await sendTextMessage({
       apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
       token: state.account.token,
       routeTag: cfg.routeTag,
@@ -239,6 +287,13 @@ async function sendReply(cfg, state, message, text) {
       contextToken,
       text: chunk,
     });
+    console.log([
+      "[wechat-send]",
+      `to=${message.from_user_id}`,
+      `context=${contextToken ? "yes" : "no"}`,
+      `len=${chunk.length}`,
+      `resp=${JSON.stringify(response || {})}`,
+    ].join(" "));
   }
 }
 
@@ -324,6 +379,18 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
     if (handled) return;
   }
 
+  const { workspaceKey, prompt: rawPrompt } = resolveWorkspace(cfg, state, fromUserId, rawText);
+  const resolvedNewSession = normalizeNewSessionDirective(rawPrompt);
+
+  if (resolvedNewSession.requested && !resolvedNewSession.prompt) {
+    if (workspaceKey && cfg.workspaces[workspaceKey]) {
+      clearCodexSession(state, fromUserId, workspaceKey);
+      saveState(cfg.stateDir, state);
+    }
+    await sendReply(cfg, state, message, "已清空当前 Codex 会话。下一条消息会使用新会话。");
+    return;
+  }
+
   const directMediaPath = resolveDirectMediaRequest(rawText);
   if (directMediaPath) {
     if (!directMediaPath || !/\.[A-Za-z0-9]+$/.test(directMediaPath)) {
@@ -331,7 +398,7 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
       return;
     }
     try {
-      const contextToken = resolveMessageContextToken(state, message);
+      const contextToken = resolveOutboundContextToken(cfg, state, message);
       await sendLocalMediaFile({
         apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
         token: state.account.token,
@@ -354,12 +421,17 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
     return;
   }
 
-  const { workspaceKey, prompt } = resolveWorkspace(cfg, state, fromUserId, rawText);
   if (!workspaceKey || !cfg.workspaces[workspaceKey]) {
     await sendReply(cfg, state, message, "No valid workspace is configured. Check webot.config.json.");
     return;
   }
+  const sessionRequested = resolvedNewSession.requested;
+  const prompt = sessionRequested ? resolvedNewSession.prompt : rawPrompt;
   if (!prompt) {
+    if (sessionRequested) {
+      await sendReply(cfg, state, message, "已准备新会话，但没有检测到可执行的提示词。下一条消息会使用新会话。");
+      return;
+    }
     await sendReply(cfg, state, message, "The prompt is empty.");
     return;
   }
@@ -370,6 +442,10 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
   if (busyRef.busy) {
     await sendReply(cfg, state, message, cfg.behavior.busyNotice);
     return;
+  }
+
+  if (sessionRequested) {
+    clearCodexSession(state, fromUserId, workspaceKey);
   }
 
   busyRef.busy = true;
@@ -388,8 +464,33 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
       prompt,
       conversationMemory,
       onEvent: (event) => progress.onEvent(event),
+      forceNewSession: sessionRequested,
     });
     const delivery = summarizeMcpDelivery(result.events);
+    if (result.usage) {
+      appendCodexUsage(state, {
+        fromUserId,
+        workspaceKey,
+        sessionId: result.sessionId || "",
+        ...result.usage,
+      });
+      console.log(`[codex-usage] user=${fromUserId} workspace=${workspaceKey} ${formatUsageForLog(result.usage)}`);
+    }
+    if (result.usage || result.sessionId) {
+      const sessionRecord = updateCodexSessionUsage(
+        state,
+        fromUserId,
+        workspaceKey,
+        {
+          id: result.sessionId || "",
+          workspacePath,
+        },
+        result.usage || {},
+      );
+      if (result.usage) {
+        sessionRecord.lastTurnUsage = { ...result.usage };
+      }
+    }
     appendUserMemoryTurn(state, fromUserId, "user", prompt, cfg.behavior?.memory || {});
     appendUserMemoryTurn(state, fromUserId, "assistant", result.text, cfg.behavior?.memory || {});
     // If Codex already delivered media through Webot MCP, do not mirror the

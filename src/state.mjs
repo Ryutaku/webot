@@ -7,6 +7,7 @@ function defaultState() {
     account: null,
     cursor: "",
     codexSessions: {},
+    codexUsageHistory: [],
     userPrefs: {},
     userSessions: {},
     recentMessageIds: [],
@@ -99,6 +100,41 @@ function buildCodexSessionKey(fromUserId, workspaceKey) {
   return `${fromUserId}::${workspaceKey}`;
 }
 
+function createZeroUsageTotals() {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    uncachedInputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    turns: 0,
+  };
+}
+
+function normalizeUsageTotals(usage = {}) {
+  return {
+    inputTokens: Number(usage.inputTokens || 0),
+    cachedInputTokens: Number(usage.cachedInputTokens || 0),
+    uncachedInputTokens: Number(usage.uncachedInputTokens || 0),
+    outputTokens: Number(usage.outputTokens || 0),
+    totalTokens: Number(usage.totalTokens || 0),
+    turns: Number(usage.turns || 0),
+  };
+}
+
+function addUsageTotals(base = createZeroUsageTotals(), delta = {}) {
+  const next = normalizeUsageTotals(base);
+  const addition = normalizeUsageTotals(delta);
+  return {
+    inputTokens: next.inputTokens + addition.inputTokens,
+    cachedInputTokens: next.cachedInputTokens + addition.cachedInputTokens,
+    uncachedInputTokens: next.uncachedInputTokens + addition.uncachedInputTokens,
+    outputTokens: next.outputTokens + addition.outputTokens,
+    totalTokens: next.totalTokens + addition.totalTokens,
+    turns: next.turns + Math.max(1, addition.turns || 0),
+  };
+}
+
 export function getCodexSession(state, fromUserId, workspaceKey) {
   if (!fromUserId || !workspaceKey) return null;
   return state.codexSessions?.[buildCodexSessionKey(fromUserId, workspaceKey)] || null;
@@ -119,6 +155,62 @@ export function clearCodexSession(state, fromUserId, workspaceKey) {
   delete state.codexSessions?.[buildCodexSessionKey(fromUserId, workspaceKey)];
 }
 
+export function updateCodexSessionUsage(state, fromUserId, workspaceKey, sessionData = {}, usage = {}) {
+  if (!fromUserId || !workspaceKey) return null;
+
+  const key = buildCodexSessionKey(fromUserId, workspaceKey);
+  const current = state.codexSessions?.[key] || {};
+  const currentSessionId = String(current.id || "");
+  const nextSessionId = String(sessionData?.id || currentSessionId || "");
+  const isNewSession = Boolean(currentSessionId && nextSessionId && nextSessionId !== currentSessionId);
+  const currentTotals = isNewSession
+    ? createZeroUsageTotals()
+    : normalizeUsageTotals(current.usageTotals);
+  const nextTotals = addUsageTotals(currentTotals, usage);
+  const alertedThresholds = isNewSession
+    ? []
+    : Array.isArray(current.alertedThresholds)
+      ? current.alertedThresholds.slice()
+      : [];
+
+  state.codexSessions[key] = {
+    ...current,
+    ...sessionData,
+    id: nextSessionId,
+    workspacePath: sessionData?.workspacePath || current.workspacePath || "",
+    usageTotals: nextTotals,
+    alertedThresholds,
+    updatedAt: Date.now(),
+  };
+
+  return state.codexSessions[key];
+}
+
+export function markCodexSessionThresholds(state, fromUserId, workspaceKey, thresholds = []) {
+  if (!fromUserId || !workspaceKey || !thresholds.length) return;
+  const key = buildCodexSessionKey(fromUserId, workspaceKey);
+  const current = state.codexSessions?.[key];
+  if (!current) return;
+  const alertedThresholds = Array.isArray(current.alertedThresholds) ? current.alertedThresholds.slice() : [];
+  for (const threshold of thresholds) {
+    if (!alertedThresholds.includes(threshold)) {
+      alertedThresholds.push(threshold);
+    }
+  }
+  current.alertedThresholds = alertedThresholds.sort((a, b) => a - b);
+  current.updatedAt = Date.now();
+}
+
+export function appendCodexUsage(state, entry = {}) {
+  if (!entry || typeof entry !== "object") return;
+  const history = Array.isArray(state.codexUsageHistory) ? state.codexUsageHistory.slice() : [];
+  history.push({
+    ts: Date.now(),
+    ...entry,
+  });
+  state.codexUsageHistory = history.slice(-200);
+}
+
 function normalizeSnippet(text, maxChars) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return "";
@@ -133,6 +225,8 @@ export function appendUserMemoryTurn(state, fromUserId, role, text, options = {}
   if (!fromUserId) return;
   const maxTurns = Number(options.maxTurns || 12);
   const snippetChars = Number(options.snippetChars || 280);
+  const includeAssistant = options.includeAssistant !== false;
+  if (role === "assistant" && !includeAssistant) return;
   if (role === "assistant" && isLegacyDeliveryText(text)) return;
   const snippet = normalizeSnippet(text, snippetChars);
   if (!snippet) return;
@@ -152,9 +246,13 @@ export function appendUserMemoryTurn(state, fromUserId, role, text, options = {}
 export function buildUserMemoryPrompt(state, fromUserId, options = {}) {
   const maxTurns = Number(options.maxTurns || 12);
   const maxChars = Number(options.maxChars || 4000);
+  const includeAssistant = options.includeAssistant !== false;
   const session = getUserSession(state, fromUserId);
   const turns = Array.isArray(session?.memoryTurns)
-    ? session.memoryTurns.filter((turn) => !(turn?.role === "assistant" && isLegacyDeliveryText(turn?.text))).slice(-maxTurns)
+    ? session.memoryTurns
+      .filter((turn) => includeAssistant || turn?.role !== "assistant")
+      .filter((turn) => !(turn?.role === "assistant" && isLegacyDeliveryText(turn?.text)))
+      .slice(-maxTurns)
     : [];
   if (!turns.length) return "";
 

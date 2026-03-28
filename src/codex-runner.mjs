@@ -42,6 +42,28 @@ function readOutputText(outputFile) {
   }
 }
 
+function extractUsage(events = []) {
+  const usage = events
+    .filter((event) => event?.type === "turn.completed" && event?.usage)
+    .map((event) => event.usage)
+    .at(-1);
+
+  if (!usage) return null;
+
+  const inputTokens = Number(usage.input_tokens || 0);
+  const cachedInputTokens = Number(usage.cached_input_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || 0);
+  const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
+
+  return {
+    inputTokens,
+    cachedInputTokens,
+    uncachedInputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  };
+}
+
 function resolveExecutableMatches(command) {
   if (command.includes("\\") || command.includes("/") || path.extname(command)) {
     return [command];
@@ -160,6 +182,17 @@ function isResumeFailure(stderrText) {
   return /resume|session|not found|unknown session|could not load/i.test(stderrText || "");
 }
 
+function buildSandboxArgs(sandboxMode, { resume = false } = {}) {
+  const mode = sandboxMode || "read-only";
+  if (mode === "danger-full-access") {
+    return ["--dangerously-bypass-approvals-and-sandbox"];
+  }
+  if (resume) {
+    return [];
+  }
+  return ["--sandbox", mode];
+}
+
 export async function runCodexPrompt({
   cfg,
   workspacePath,
@@ -182,23 +215,29 @@ export async function runCodexPrompt({
     "-c",
     `mcp_servers.webot.env={WEBOT_SESSION_FILE='${sessionFile.replace(/\\/g, "\\\\")}'}`,
   ];
-  const baseArgs = [
+  const commonArgs = [
     ...mcpConfigArgs,
     ...modelArgs,
     "--json",
-    "--color",
-    "never",
     "--output-last-message",
     outputFile,
-    "--sandbox",
-    cfg.codex.sandbox || "read-only",
-    "--cd",
-    workspacePath,
     ...((cfg.codex.extraArgs || []).filter(Boolean)),
   ];
+  const execArgs = [
+    ...commonArgs,
+    "--color",
+    "never",
+    ...buildSandboxArgs(cfg.codex.sandbox, { resume: false }),
+    "--cd",
+    workspacePath,
+  ];
+  const resumeArgs = [
+    ...commonArgs,
+    ...buildSandboxArgs(cfg.codex.sandbox, { resume: true }),
+  ];
   const args = resumeSessionId
-    ? ["exec", "resume", resumeSessionId, ...baseArgs, "-"]
-    : ["exec", ...baseArgs, "-"];
+    ? ["exec", "resume", ...resumeArgs, resumeSessionId, "-"]
+    : ["exec", ...execArgs, "-"];
 
   const spawnSpec = buildSpawnSpec(cfg.codex.command || "codex", args);
   const input = buildPrompt(cfg.behavior.systemPreamble, prompt, conversationMemory);
@@ -268,6 +307,7 @@ export async function runCodexPrompt({
         stdout,
         stderr,
         events,
+        usage: extractUsage(events),
         sessionId: detectedSession?.id || resumeSessionId || "",
       });
     });
