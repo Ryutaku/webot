@@ -6,6 +6,7 @@ function defaultState() {
   return {
     account: null,
     cursor: "",
+    codexSessions: {},
     userPrefs: {},
     userSessions: {},
     recentMessageIds: [],
@@ -94,16 +95,45 @@ export function getUserSession(state, fromUserId) {
   return state.userSessions[fromUserId] || null;
 }
 
+function buildCodexSessionKey(fromUserId, workspaceKey) {
+  return `${fromUserId}::${workspaceKey}`;
+}
+
+export function getCodexSession(state, fromUserId, workspaceKey) {
+  if (!fromUserId || !workspaceKey) return null;
+  return state.codexSessions?.[buildCodexSessionKey(fromUserId, workspaceKey)] || null;
+}
+
+export function setCodexSession(state, fromUserId, workspaceKey, sessionData = {}) {
+  if (!fromUserId || !workspaceKey || !sessionData?.id) return;
+  const key = buildCodexSessionKey(fromUserId, workspaceKey);
+  state.codexSessions[key] = {
+    ...(state.codexSessions[key] || {}),
+    ...sessionData,
+    updatedAt: Date.now(),
+  };
+}
+
+export function clearCodexSession(state, fromUserId, workspaceKey) {
+  if (!fromUserId || !workspaceKey) return;
+  delete state.codexSessions?.[buildCodexSessionKey(fromUserId, workspaceKey)];
+}
+
 function normalizeSnippet(text, maxChars) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return "";
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+function isLegacyDeliveryText(text) {
+  return /^SEND_(FILE|IMAGE|VIDEO):\s*\S+/i.test(String(text || "").trim());
+}
+
 export function appendUserMemoryTurn(state, fromUserId, role, text, options = {}) {
   if (!fromUserId) return;
   const maxTurns = Number(options.maxTurns || 12);
   const snippetChars = Number(options.snippetChars || 280);
+  if (role === "assistant" && isLegacyDeliveryText(text)) return;
   const snippet = normalizeSnippet(text, snippetChars);
   if (!snippet) return;
 
@@ -123,7 +153,9 @@ export function buildUserMemoryPrompt(state, fromUserId, options = {}) {
   const maxTurns = Number(options.maxTurns || 12);
   const maxChars = Number(options.maxChars || 4000);
   const session = getUserSession(state, fromUserId);
-  const turns = Array.isArray(session?.memoryTurns) ? session.memoryTurns.slice(-maxTurns) : [];
+  const turns = Array.isArray(session?.memoryTurns)
+    ? session.memoryTurns.filter((turn) => !(turn?.role === "assistant" && isLegacyDeliveryText(turn?.text))).slice(-maxTurns)
+    : [];
   if (!turns.length) return "";
 
   const lines = ["Recent conversation memory:"];

@@ -77,19 +77,58 @@ function getFileKind(filePath) {
   return "file";
 }
 
+function getPathStatus(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    return {
+      exists: true,
+      isDirectory: stats.isDirectory(),
+      isFile: stats.isFile(),
+    };
+  } catch {
+    return {
+      exists: false,
+      isDirectory: false,
+      isFile: false,
+    };
+  }
+}
+
 function isLowValueWechatAck(text) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
   if (!normalized) return true;
-  return (
-    normalized.startsWith("sent to wechat") ||
-    normalized.startsWith("sent to微信") ||
-    normalized.startsWith("已发到微信") ||
-    normalized.startsWith("已经发到微信") ||
-    normalized.startsWith("已发送到微信") ||
-    normalized.startsWith("已发微信") ||
-    normalized === "已发送。" ||
-    normalized === "已发送"
-  );
+
+  const exactMatches = new Set([
+    "sent",
+    "done",
+    "ok",
+    "sent to wechat",
+    "already sent to wechat",
+    "send_file",
+    "sent_file",
+    "send image",
+    "sent image",
+    "send video",
+    "sent video",
+    "已发送",
+    "已发送。",
+  ]);
+  if (exactMatches.has(normalized)) return true;
+
+  return [
+    "sent to wechat",
+    "already sent to wechat",
+    "已发到微信",
+    "已经发到微信",
+    "已发送到微信",
+    "已发微信",
+    "send_file",
+    "sent_file",
+    "send image",
+    "sent image",
+    "send video",
+    "sent video",
+  ].some((prefix) => normalized.startsWith(prefix));
 }
 
 async function sendResolvedFile({ context, resolvedPath, caption = "" }) {
@@ -400,6 +439,8 @@ server.registerTool(
       inputPath: z.string(),
       resolvedPath: z.string(),
       exists: z.boolean(),
+      isDirectory: z.boolean(),
+      isFile: z.boolean(),
       kind: z.enum(["image", "video", "file"]),
     },
     annotations: {
@@ -412,10 +453,13 @@ server.registerTool(
   async ({ filePath }) => {
     const context = buildResolvedContext();
     const resolvedPath = resolveUserPath(filePath, context.workspacePath);
+    const status = getPathStatus(resolvedPath);
     const structuredContent = {
       inputPath: filePath,
       resolvedPath,
-      exists: fs.existsSync(resolvedPath),
+      exists: status.exists,
+      isDirectory: status.isDirectory,
+      isFile: status.isFile,
       kind: getFileKind(resolvedPath),
     };
 

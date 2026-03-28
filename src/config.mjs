@@ -48,6 +48,7 @@ export function loadConfig(explicitPath) {
       command: "codex",
       sandbox: "read-only",
       model: "",
+      sessionReuse: true,
       extraArgs: ["--skip-git-repo-check"],
     },
     behavior: {
@@ -68,10 +69,10 @@ export function loadConfig(explicitPath) {
         "When the user expects to receive a file, image, video, screenshot, or other artifact in WeChat, you must use the Webot MCP delivery tools when available.",
         "When you send a file, image, video, or screenshot through Webot MCP, do not send an extra confirmation like 'sent to WeChat' or '已发到微信' unless the user explicitly asked for confirmation text.",
         "For media delivery, prefer sending the media itself without a caption unless a short caption is necessary for clarity.",
+        "If an image is around 4K resolution or similarly very large, resize it to about 1080p before sending it through Webot MCP. Keep it clear and avoid overly aggressive compression, because WeChat image delivery may fail on oversized images.",
         "Do not treat a task as complete just because a file exists locally.",
         "Do not reply that a file is only in the workspace unless the user explicitly asked only for the local path.",
-        "If you create or identify a local file that should be returned to the user and MCP delivery is unavailable, include one line per file exactly as: SEND_FILE: <path>.",
-        "A task that requires delivery to the user is incomplete until the delivery tool call succeeds, or until you clearly provide a fallback path if tool delivery is unavailable.",
+        "A task that requires delivery to the user is incomplete until the Webot MCP delivery tool call succeeds.",
         "Prefer concise, result-oriented replies because the user is reading in WeChat.",
       ].join(" "),
       progressUpdates: {

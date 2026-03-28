@@ -1,10 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { buildAdminActionReply, detectAdminAction } from "./admin-actions.mjs";
 import { runCodexPrompt } from "./codex-runner.mjs";
 import {
   appendUserMemoryTurn,
+  clearCodexSession,
   buildUserMemoryPrompt,
+  getCodexSession,
   clearUserWorkspace,
   getUserSession,
   getUserWorkspace,
@@ -12,10 +15,11 @@ import {
   rememberMessage,
   rememberUserSession,
   saveState,
+  setCodexSession,
   setUserWorkspace,
 } from "./state.mjs";
 import { extractPlainText, getUpdates, sendTextMessage } from "./weixin-api.mjs";
-import { detectNewWorkspaceMediaFiles, detectResultMediaPaths, sendLocalMediaFile } from "./weixin-media.mjs";
+import { sendLocalMediaFile } from "./weixin-media.mjs";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -82,6 +86,8 @@ function buildHelp(cfg) {
     "/where Show the current workspace",
     "/reset Clear the current chat workspace preference",
     "/repo <name> <prompt> Run a prompt in a specific workspace",
+    "/stop Stop Webot locally",
+    "/status Show Webot runtime status",
     "Plain text messages are treated as prompts in the current workspace.",
     `Workspaces: ${workspaceList}`,
   ].join("\n");
@@ -115,6 +121,49 @@ function getConversationMemory(cfg, state, fromUserId) {
   const settings = cfg.behavior?.memory || {};
   if (settings.enabled === false) return "";
   return buildUserMemoryPrompt(state, fromUserId, settings);
+}
+
+async function runCodexWithSession({ cfg, state, fromUserId, workspaceKey, workspacePath, prompt, conversationMemory, onEvent }) {
+  const reuseEnabled = cfg.codex?.sessionReuse !== false;
+  const existingSession = reuseEnabled ? getCodexSession(state, fromUserId, workspaceKey) : null;
+
+  try {
+    const result = await runCodexPrompt({
+      cfg,
+      workspacePath,
+      prompt,
+      conversationMemory: existingSession ? "" : conversationMemory,
+      resumeSessionId: existingSession?.id || "",
+      onEvent,
+    });
+
+    if (reuseEnabled && result.sessionId) {
+      setCodexSession(state, fromUserId, workspaceKey, {
+        id: result.sessionId,
+        workspacePath,
+      });
+    }
+    return result;
+  } catch (error) {
+    if (existingSession && error?.resumeFailed) {
+      clearCodexSession(state, fromUserId, workspaceKey);
+      const retry = await runCodexPrompt({
+        cfg,
+        workspacePath,
+        prompt,
+        conversationMemory,
+        onEvent,
+      });
+      if (reuseEnabled && retry.sessionId) {
+        setCodexSession(state, fromUserId, workspaceKey, {
+          id: retry.sessionId,
+          workspacePath,
+        });
+      }
+      return retry;
+    }
+    throw error;
+  }
 }
 
 function summarizeMcpDelivery(events = []) {
@@ -193,26 +242,6 @@ async function sendReply(cfg, state, message, text) {
   }
 }
 
-async function sendMediaFromResult({ cfg, state, message, workspacePath, resultText, runStartedAt }) {
-  if (cfg.media?.enabled === false) return;
-
-  const contextToken = resolveMessageContextToken(state, message);
-  const explicitPaths = detectResultMediaPaths(resultText, workspacePath);
-  const freshPaths = detectNewWorkspaceMediaFiles(workspacePath, runStartedAt - 1000);
-  const mediaPaths = [...new Set([...explicitPaths, ...freshPaths])];
-  for (const mediaPath of mediaPaths) {
-    await sendLocalMediaFile({
-      apiBaseUrl: state.account.baseUrl || cfg.apiBaseUrl,
-      token: state.account.token,
-      routeTag: cfg.routeTag,
-      toUserId: message.from_user_id,
-      contextToken,
-      filePath: mediaPath,
-      cdnBaseUrl: cfg.media?.cdnBaseUrl,
-    });
-  }
-}
-
 async function handleCommand({ cfg, state, message, rawText }) {
   const fromUserId = message.from_user_id;
   const [command, ...rest] = rawText.trim().split(/\s+/);
@@ -276,6 +305,20 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
   const rawText = extractPlainText(message);
   if (!rawText) return;
 
+  const adminAction = detectAdminAction(rawText);
+  if (adminAction) {
+    try {
+      const reply = buildAdminActionReply({ cfg, state, action: adminAction.action });
+      if (reply) {
+        await sendReply(cfg, state, message, reply);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await sendReply(cfg, state, message, `Admin action failed:\n${detail}`);
+    }
+    return;
+  }
+
   if (rawText.startsWith("/")) {
     const handled = await handleCommand({ cfg, state, message, rawText });
     if (handled) return;
@@ -332,13 +375,15 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
   busyRef.busy = true;
   const workspacePath = cfg.workspaces[workspaceKey];
   const progress = createProgressReporter({ cfg, state, message });
-  const runStartedAt = Date.now();
   const conversationMemory = getConversationMemory(cfg, state, fromUserId);
 
   try {
     writeMcpSessionContext({ cfg, state, message, workspacePath });
-    const result = await runCodexPrompt({
+    const result = await runCodexWithSession({
       cfg,
+      state,
+      fromUserId,
+      workspaceKey,
       workspacePath,
       prompt,
       conversationMemory,
@@ -347,18 +392,11 @@ export async function processIncomingMessage({ cfg, state, message, busyRef }) {
     const delivery = summarizeMcpDelivery(result.events);
     appendUserMemoryTurn(state, fromUserId, "user", prompt, cfg.behavior?.memory || {});
     appendUserMemoryTurn(state, fromUserId, "assistant", result.text, cfg.behavior?.memory || {});
-    if (!delivery.sentText) {
+    // If Codex already delivered media through Webot MCP, do not mirror the
+    // model's final text back into WeChat. That final text is often just a
+    // tool/action acknowledgment such as "send_file".
+    if (!delivery.sentText && !delivery.sentMedia) {
       await sendReply(cfg, state, message, result.text);
-    }
-    if (!delivery.sentMedia) {
-      await sendMediaFromResult({
-        cfg,
-        state,
-        message,
-        workspacePath,
-        resultText: result.text,
-        runStartedAt,
-      });
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
